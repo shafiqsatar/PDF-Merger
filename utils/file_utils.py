@@ -45,14 +45,10 @@ def get_file_modified_timestamp(path: str) -> float:
 
 
 def format_bytes(size_bytes: int) -> str:
-    if size_bytes < 1024:
-        return f"{size_bytes} B"
     if size_bytes < 1024 * 1024:
-        return f"{size_bytes / 1024:.0f} KB"
-    if size_bytes < 1024 * 1024 * 1024:
-        return f"{size_bytes / (1024 * 1024):.0f} MB"
-    return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
+        return f"{size_bytes / 1024:.1f} KB"
+    return f"{size_bytes / (1024 * 1024):.1f} MB"
 
 
 def format_modified(timestamp: float) -> str:
-    return datetime.fromtimestamp(timestamp).strftime("%d %B %Y %H:%M:%S")
+    return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M")

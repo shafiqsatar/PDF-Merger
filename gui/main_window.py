@@ -2,7 +2,17 @@ import os
 from dataclasses import dataclass
 from typing import List
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QSettings
+from PyQt6.QtCore import (
+    Qt,
+    QThread,
+    pyqtSignal,
+    QObject,
+    QSettings,
+    pyqtProperty,
+    QPropertyAnimation,
+    QRect,
+)
+from PyQt6.QtGui import QCursor, QDrag, QPainter, QPalette, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QFileDialog,
@@ -40,6 +50,15 @@ class PdfItem:
     modified_ts: float
 
 
+class SortableItem(QTableWidgetItem):
+    def __lt__(self, other: "QTableWidgetItem") -> bool:  # type: ignore[override]
+        left = self.data(Qt.ItemDataRole.UserRole)
+        right = other.data(Qt.ItemDataRole.UserRole)
+        if left is not None and right is not None:
+            return left < right
+        return super().__lt__(other)
+
+
 class FileListWidget(QTableWidget):
     external_files_dropped = pyqtSignal(list)
 
@@ -54,9 +73,11 @@ class FileListWidget(QTableWidget):
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.setDefaultDropAction(Qt.DropAction.CopyAction)
-        self.setDropIndicatorShown(True)
+        self.setDropIndicatorShown(False)
+        self.setDragDropOverwriteMode(False)
         self.setAlternatingRowColors(True)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.setMouseTracking(True)
         self.horizontalHeader().setStretchLastSection(True)
         self.horizontalHeader().setSectionResizeMode(0, self.horizontalHeader().ResizeMode.Stretch)
         self.horizontalHeader().setSectionResizeMode(1, self.horizontalHeader().ResizeMode.ResizeToContents)
@@ -64,6 +85,7 @@ class FileListWidget(QTableWidget):
         self.horizontalHeader().setSectionResizeMode(3, self.horizontalHeader().ResizeMode.ResizeToContents)
         self.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft)
         self.setSortingEnabled(True)
+        self.horizontalHeader().sectionClicked.connect(self._handle_header_sort)
         self.verticalHeader().setVisible(False)
         self.setShowGrid(False)
 
@@ -71,6 +93,15 @@ class FileListWidget(QTableWidget):
         self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._placeholder.setObjectName("DropLabel")
         self._placeholder.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._drop_row: int | None = None
+        self._drop_pos_y: int | None = None
+        self._indicator_opacity = 0.0
+        self._indicator_anim = QPropertyAnimation(self, b"indicatorOpacity", self)
+        self._indicator_anim.setDuration(140)
+        self._drag_rows: list[int] = []
+        self._drag_active = False
+        self._sorting_disabled_by_drag = False
+        self._hover_row: int | None = None
         self._update_placeholder()
 
     def resizeEvent(self, event):  # type: ignore[override]
@@ -83,27 +114,122 @@ class FileListWidget(QTableWidget):
     def dropEvent(self, event):  # type: ignore[override]
         # Allow reordering inside the list
         if event.source() is self:
-            self.setDefaultDropAction(Qt.DropAction.MoveAction)
-            super().dropEvent(event)
-            self.setDefaultDropAction(Qt.DropAction.CopyAction)
+            event.setDropAction(Qt.DropAction.CopyAction)
+            pos = self._to_viewport_pos(event.position().toPoint())
+            self._move_rows_to_target(self._drag_rows, self._drop_target_row(pos))
+            self._drag_rows = []
+            self._drag_active = False
+            event.acceptProposedAction()
+            self._clear_drop_row()
             return
 
         if event.mimeData().hasUrls():
+            event.setDropAction(Qt.DropAction.CopyAction)
             paths = [url.toLocalFile() for url in event.mimeData().urls()]
             self.external_files_dropped.emit(paths)
             event.acceptProposedAction()
+        self._clear_drop_row()
 
     def dragEnterEvent(self, event):  # type: ignore[override]
-        if event.mimeData().hasUrls():
+        if event.source() is self:
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.acceptProposedAction()
+        elif event.mimeData().hasUrls():
+            event.setDropAction(Qt.DropAction.CopyAction)
             event.acceptProposedAction()
         else:
             super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event):  # type: ignore[override]
-        if event.mimeData().hasUrls():
+        if event.source() is self:
+            event.setDropAction(Qt.DropAction.CopyAction)
             event.acceptProposedAction()
+            pos = self._to_viewport_pos(event.position().toPoint())
+            self._update_drop_row(pos)
+        elif event.mimeData().hasUrls():
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.acceptProposedAction()
+            pos = self._to_viewport_pos(event.position().toPoint())
+            self._update_drop_row(pos)
         else:
             super().dragMoveEvent(event)
+
+    def dragLeaveEvent(self, event):  # type: ignore[override]
+        self._clear_drop_row()
+        super().dragLeaveEvent(event)
+
+    def leaveEvent(self, event):  # type: ignore[override]
+        self._hover_row = None
+        self.viewport().update()
+        super().leaveEvent(event)
+
+    def mouseMoveEvent(self, event):  # type: ignore[override]
+        index = self.indexAt(event.position().toPoint())
+        row = index.row() if index.isValid() else None
+        if self._hover_row != row:
+            self._hover_row = row
+            self.viewport().update()
+        super().mouseMoveEvent(event)
+
+    def startDrag(self, supportedActions) -> None:  # type: ignore[override]
+        self._drag_rows = sorted({idx.row() for idx in self.selectionModel().selectedRows()})
+        self._drag_active = True
+        if self.isSortingEnabled():
+            self.setSortingEnabled(False)
+            self._sorting_disabled_by_drag = True
+        indexes = self.selectionModel().selectedIndexes()
+        if not indexes:
+            return
+
+        drag = QDrag(self)
+        mime_data = self.model().mimeData(indexes)
+        drag.setMimeData(mime_data)
+
+        region = self.visualRegionForSelection(self.selectionModel().selection())
+        rect = region.boundingRect()
+        if not rect.isNull():
+            pixmap = self.viewport().grab(rect)
+            if not pixmap.isNull():
+                translucent = QPixmap(pixmap.size())
+                translucent.fill(Qt.GlobalColor.transparent)
+                painter = QPainter(translucent)
+                painter.setOpacity(0.5)
+                painter.drawPixmap(0, 0, pixmap)
+                painter.end()
+                drag.setPixmap(translucent)
+                cursor_pos = self.viewport().mapFromGlobal(QCursor.pos())
+                drag.setHotSpot(cursor_pos - rect.topLeft())
+
+        drag.exec(supportedActions)
+        self._drag_active = False
+        self._clear_drop_row()
+
+    def paintEvent(self, event):  # type: ignore[override]
+        super().paintEvent(event)
+        painter = QPainter(self.viewport())
+        if self._hover_row is not None:
+            hover_index = self.model().index(self._hover_row, 0)
+            hover_rect = self.visualRect(hover_index)
+            hover_rect.setLeft(0)
+            hover_rect.setRight(self.viewport().width())
+            hover_color = self.palette().color(QPalette.ColorRole.Highlight)
+            hover_color.setAlpha(40)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(hover_color)
+            painter.drawRect(hover_rect)
+
+        if self._drop_row is None or self._drop_pos_y is None or self._indicator_opacity <= 0:
+            return
+        color = self.palette().color(QPalette.ColorRole.Highlight)
+        color.setAlphaF(min(0.6, max(0.0, self._indicator_opacity)))
+        painter.setBrush(color)
+        painter.setPen(Qt.PenStyle.NoPen)
+        left = 4
+        right = self.viewport().width() - 4
+        y = self._drop_pos_y
+        height = 8
+        rect = QRect(left, y - height // 2, right - left, height)
+        painter.drawRoundedRect(rect, 4, 4)
 
     def add_row(self) -> int:
         row = self.rowCount()
@@ -118,6 +244,119 @@ class FileListWidget(QTableWidget):
     def remove_row(self, row: int) -> None:
         self.removeRow(row)
         self._update_placeholder()
+
+    def _set_drop_row(self, row: int | None) -> None:
+        if self._drop_row == row:
+            return
+        self._drop_row = row
+        self._fade_indicator(1.0)
+        self.viewport().update()
+
+    def _clear_drop_row(self) -> None:
+        if self._drop_row is None:
+            return
+        self._fade_indicator(0.0)
+
+    def _update_drop_row(self, pos) -> None:
+        if self.rowCount() == 0:
+            self._drop_pos_y = self.viewport().rect().center().y()
+            self._set_drop_row(0)
+            return
+        row = self._drop_target_row(pos)
+        self._drop_pos_y = self._drop_indicator_y(row)
+        self._set_drop_row(row)
+
+    def _drop_target_row(self, pos) -> int:
+        index = self.indexAt(pos)
+        if index.isValid():
+            rect = self.visualRect(index)
+            return index.row() + (1 if pos.y() >= rect.center().y() else 0)
+        return self.rowCount()
+
+    def _drop_indicator_y(self, target_row: int) -> int:
+        if self.rowCount() == 0:
+            return self.viewport().rect().center().y()
+        if target_row <= 0:
+            first_rect = self.visualRect(self.model().index(0, 0))
+            return first_rect.top()
+        if target_row >= self.rowCount():
+            last_rect = self.visualRect(self.model().index(self.rowCount() - 1, 0))
+            return last_rect.bottom()
+        rect = self.visualRect(self.model().index(target_row, 0))
+        return rect.top()
+
+    def _move_rows_to_target(self, rows: list[int], target_row: int, *, preview: bool = False) -> None:
+        if not rows:
+            return
+
+        min_row = rows[0]
+        max_row = rows[-1]
+        if min_row <= target_row <= max_row + 1:
+            return
+
+        row_data: list[list[QTableWidgetItem | None]] = []
+        for row in rows:
+            items: list[QTableWidgetItem | None] = []
+            for col in range(self.columnCount()):
+                item = self.item(row, col)
+                items.append(item.clone() if item else None)
+            row_data.append(items)
+
+        self.setUpdatesEnabled(False)
+        was_sorting = self.isSortingEnabled()
+        if was_sorting:
+            self.setSortingEnabled(False)
+        try:
+            for row in reversed(rows):
+                self.removeRow(row)
+
+            offset = sum(1 for row in rows if row < target_row)
+            target_row -= offset
+            target_row = max(0, min(target_row, self.rowCount()))
+
+            insert_at = target_row
+            for items in row_data:
+                self.insertRow(insert_at)
+                for col, item in enumerate(items):
+                    self.setItem(insert_at, col, item or QTableWidgetItem(""))
+                insert_at += 1
+
+            if not preview:
+                self.clearSelection()
+                for row in range(target_row, target_row + len(row_data)):
+                    self.selectRow(row)
+                self._update_placeholder()
+        finally:
+            if was_sorting:
+                self.setSortingEnabled(True)
+            self.setUpdatesEnabled(True)
+
+    # Preview reordering is intentionally disabled to prevent jitter.
+
+    def _to_viewport_pos(self, pos):
+        return self.viewport().mapFrom(self, pos)
+
+    def _handle_header_sort(self, section: int) -> None:
+        if not self.isSortingEnabled():
+            self.setSortingEnabled(True)
+        self.sortItems(section)
+
+    def _fade_indicator(self, target: float) -> None:
+        self._indicator_anim.stop()
+        self._indicator_anim.setStartValue(self._indicator_opacity)
+        self._indicator_anim.setEndValue(target)
+        self._indicator_anim.start()
+
+    def _get_indicator_opacity(self) -> float:
+        return self._indicator_opacity
+
+    def _set_indicator_opacity(self, value: float) -> None:
+        self._indicator_opacity = value
+        if value <= 0.0 and self._indicator_anim.endValue() == 0.0:
+            self._drop_row = None
+        self.viewport().update()
+
+    indicatorOpacity = pyqtProperty(float, _get_indicator_opacity, _set_indicator_opacity)
 
 
 class MergeWorker(QObject):
@@ -172,6 +411,7 @@ class MainWindow(QMainWindow):
         self.remove_button = QPushButton("Remove Selected")
         self.clear_button = QPushButton("Clear List")
         self.merge_button = QPushButton("Merge PDFs")
+        self.merge_button.setObjectName("MergeButton")
 
         self.add_button.clicked.connect(self._add_files_dialog)
         self.remove_button.clicked.connect(self._remove_selected)
@@ -241,9 +481,17 @@ class MainWindow(QMainWindow):
         name_item = QTableWidgetItem(os.path.basename(item.path))
         name_item.setData(Qt.ItemDataRole.UserRole, item.path)
 
-        size_item = QTableWidgetItem(format_bytes(item.size_bytes))
-        pages_item = QTableWidgetItem(str(item.pages))
-        modified_item = QTableWidgetItem(format_modified(item.modified_ts))
+        size_item = SortableItem()
+        size_item.setData(Qt.ItemDataRole.DisplayRole, format_bytes(item.size_bytes))
+        size_item.setData(Qt.ItemDataRole.UserRole, item.size_bytes)
+
+        pages_item = SortableItem()
+        pages_item.setData(Qt.ItemDataRole.DisplayRole, str(item.pages))
+        pages_item.setData(Qt.ItemDataRole.UserRole, item.pages)
+
+        modified_item = SortableItem()
+        modified_item.setData(Qt.ItemDataRole.DisplayRole, format_modified(item.modified_ts))
+        modified_item.setData(Qt.ItemDataRole.UserRole, item.modified_ts)
 
         self.list_widget.setItem(row, 0, name_item)
         self.list_widget.setItem(row, 1, size_item)
@@ -342,6 +590,10 @@ class MainWindow(QMainWindow):
                 QHeaderView::section { background: #242630; color: #e6e6e6; border: 0px; padding: 6px; }
                 QPushButton { background: #2f3240; color: #e6e6e6; border: 1px solid #3b3f4f; padding: 8px 14px; border-radius: 6px; }
                 QPushButton:hover { background: #3a3e52; }
+                QPushButton:pressed { background: #262a39; border-color: #242731; padding-top: 9px; padding-bottom: 7px; }
+                QPushButton#MergeButton { background: #dc2626; border-color: #b91c1c; color: #ffffff; }
+                QPushButton#MergeButton:hover { background: #ef4444; }
+                QPushButton#MergeButton:pressed { background: #b91c1c; border-color: #991b1b; padding-top: 9px; padding-bottom: 7px; }
                 QMenuBar { background: #1b1c22; color: #e6e6e6; }
                 QMenuBar::item:selected { background: #2b2e3a; }
                 QMenu { background: #1b1c22; color: #e6e6e6; }
@@ -358,6 +610,10 @@ class MainWindow(QMainWindow):
                 QHeaderView::section { background: #eef2f7; color: #1b1c22; border: 0px; padding: 6px; }
                 QPushButton { background: #ffffff; color: #1b1c22; border: 1px solid #d0d7e2; padding: 8px 14px; border-radius: 6px; }
                 QPushButton:hover { background: #f1f5f9; }
+                QPushButton:pressed { background: #e2e8f0; border-color: #cbd5e1; padding-top: 9px; padding-bottom: 7px; }
+                QPushButton#MergeButton { background: #dc2626; border-color: #b91c1c; color: #ffffff; }
+                QPushButton#MergeButton:hover { background: #ef4444; }
+                QPushButton#MergeButton:pressed { background: #b91c1c; border-color: #991b1b; padding-top: 9px; padding-bottom: 7px; }
                 QMenuBar { background: #ffffff; color: #1b1c22; }
                 QMenuBar::item:selected { background: #e2e8f0; }
                 QMenu { background: #ffffff; color: #1b1c22; }
