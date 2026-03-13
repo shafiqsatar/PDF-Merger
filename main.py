@@ -5,19 +5,19 @@ from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication
 
 from gui.main_window import MainWindow
+from utils.resource_utils import resource_path
 
 
 def main() -> int:
     app = QApplication(sys.argv)
-    app.setOrganizationName("PDFMergePro")
-    app.setApplicationName("PDF Merge Pro")
+    app.setOrganizationName("PDFMerger")
+    app.setApplicationName("PDF Merger")
 
     window = MainWindow()
 
-    # Optional app icon support: drop an .ico file into assets/app.ico
-    icon_path = os.path.join(os.path.dirname(__file__), "assets", "app.ico")
-    if os.path.exists(icon_path):
-        window.setWindowIcon(QIcon(icon_path))
+    icon_ico = resource_path(os.path.join("gui", "assets", "app_icon.ico"))
+    if os.path.exists(icon_ico):
+        window.setWindowIcon(QIcon(icon_ico))
 
     window.show()
     return app.exec()
